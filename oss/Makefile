@@ -532,20 +532,6 @@ harfbuzz-cov: harfbuzz
 	ninja -v -j$$(nproc) test/fuzzing/hb-shape-fuzzer && \
 	mv test/fuzzing/hb-shape-fuzzer .
 
-# HarfBuzz with AFL++ Instrumentation
-harfbuzz-mufuzz: harfbuzz
-	export AFL_LLVM_INSTRUMENT=CLASSIC AFL_OLD_FORKSERVER=1 && \
-	cd harfbuzz && \
-	mkdir -p build-afl-mufuzz && cd build-afl-mufuzz && \
-	CC=afl-clang-fast CXX=afl-clang-fast++ \
-	CFLAGS="-fno-sanitize=vptr -DHB_NO_VISIBILITY" \
-	CXXFLAGS="-fno-sanitize=vptr -DHB_NO_VISIBILITY" \
-	meson .. --default-library=static --wrap-mode=nodownload \
-		-Dexperimental_api=true \
-		-Dfuzzer_ldflags="${AFLPLUSPLUS}/utils/aflpp_driver/libAFLDriver.a" && \
-	ninja -v -j$$(nproc) test/fuzzing/hb-shape-fuzzer && \
-	mv test/fuzzing/hb-shape-fuzzer .
-
 # aggregate targets
 harfbuzz-all: harfbuzz-afl harfbuzz-wllvm harfbuzz-profiling harfbuzz-cov
 harfbuzz-clean-all:
