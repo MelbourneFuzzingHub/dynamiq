@@ -51,7 +51,6 @@ export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 ```bash
 echo core | sudo tee /proc/sys/kernel/core_pattern
 ```
-This allows AFL++ to capture crashes correctly via `waitpid()`.
 ## Setup required packages & environment variables
 ```bash
 cd $WORKDIR
