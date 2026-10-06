@@ -7,7 +7,7 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 mod build_tasks;
-use build_tasks::{jsoncpp, lcms, libjpeg_turbo, libpcap, libpng, libxml2, libxslt, harfbuzz, sqlite3, vorbis, libaom, mbedtls, freetype2, bloaty};
+use build_tasks::{jsoncpp, lcms, libjpeg_turbo, libpcap, libpng, libxml2, libxslt, harfbuzz, sqlite3, vorbis, libaom, mbedtls, freetype2, bloaty, php, openssl, poppler, libtiff, lua, libsndfile};
 
 #[derive(Parser)]
 struct Args {
@@ -194,6 +194,8 @@ fn main() {
         // Fall back to default based on binary_name
         match binary_name.as_str() {
             "ossfuzz" => 2,
+            "php-fuzz-parser" => 2,
+            "lua" => 0,
             _ => 4,
         }
     };
@@ -224,12 +226,22 @@ fn main() {
         "xpath" => libxslt::build_xpath(&Path::new(&target_dir), Some(task_id.clone())),
         "libjpeg_turbo_fuzzer" => libjpeg_turbo::build_libjpeg_turbo_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
         "hb-shape-fuzzer" => harfbuzz::build_hb_shape_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
+        "hb-subset-fuzzer" => harfbuzz::build_hb_subset_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
         "ossfuzz" => sqlite3::build_sqlite3_afl(&Path::new(&target_dir), Some(task_id.clone())),
         "decode_fuzzer" => vorbis::build_vorbis(&Path::new(&target_dir), Some(task_id.clone())),
         "av1_dec_fuzzer" => libaom::build_av1_dec_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
         "fuzz_dtlsclient" => mbedtls::build_fuzz_dtlsclient(&Path::new(&target_dir), Some(task_id.clone())),
         "ftfuzzer" => freetype2::build_ftfuzzer(&Path::new(&target_dir), Some(task_id.clone())),
         "bloaty_fuzz_target" => bloaty::build_bloaty_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
+        "php-fuzz-parser" => php::build_php_fuzz_parser_afl(&Path::new(&target_dir), Some(task_id.clone())),
+        "php-fuzz-exif" => php::build_php_fuzz_exif_afl(&Path::new(&target_dir), Some(task_id.clone())),
+        "x509" => openssl::build_openssl_x509(&Path::new(&target_dir), Some(task_id.clone())),
+        "pdf_fuzzer" => poppler::build_pdf_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
+        "pdftoppm" => poppler::build_pdftoppm(&Path::new(&target_dir), Some(task_id.clone())),
+        "tiff_read_rgba_fuzzer" => libtiff::build_tiff_read_rgba_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
+        "lua" => lua::build_lua_cli(&Path::new(&target_dir), Some(task_id.clone())),
+        "fuzz_lua" => lua::build_lua_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
+        "sndfile_fuzzer" => libsndfile::build_sndfile_fuzzer(&Path::new(&target_dir), Some(task_id.clone())),
         _ => generic_build_process(&args, &target_dir, &binary_name),
     }
 

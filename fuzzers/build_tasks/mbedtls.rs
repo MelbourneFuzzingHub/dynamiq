@@ -23,13 +23,14 @@ pub fn build_fuzz_dtlsclient(target_dir: &Path, task_id: Option<String>) {
     fs::create_dir_all(&build_dir).expect("Failed to create build directory");
 
     // Get AFL++ path
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
     let fuzzing_engine = format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path);
 
     // Set environment variables for AFL++
     env::set_var("CC", "afl-clang-fast");
     env::set_var("CXX", "afl-clang-fast++");
-    env::set_var("LIB_FUZZING_ENGINE", &fuzzing_engine);
+    env::set_var("FUZZER_LIB", &fuzzing_engine);
 
     // Run CMake with AFL++ instrumentation
     Command::new("cmake")
@@ -39,9 +40,10 @@ pub fn build_fuzz_dtlsclient(target_dir: &Path, task_id: Option<String>) {
         .status()
         .expect("Couldn't configure mbedTLS with AFL++");
 
-    // Run `make -j$(nproc)`
+    // Run `make -j$(nproc) fuzz_dtlsclient`
     Command::new("make")
         .arg(format!("-j{}", num_cpus::get()))
+        .arg("fuzz_dtlsclient")
         .current_dir(&build_dir)
         .status()
         .expect("Couldn't build mbedTLS with make");

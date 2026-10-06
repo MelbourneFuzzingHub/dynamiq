@@ -22,7 +22,8 @@ pub fn build_fuzz_xml(target_dir: &Path, task_id: Option<String>) {
     // Set environment variables
     let cc = "afl-clang-fast";
     let cxx = "afl-clang-fast++";
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Configure the build
     Command::new("../configure")
@@ -50,19 +51,22 @@ pub fn build_fuzz_xml(target_dir: &Path, task_id: Option<String>) {
 
     let source_files = vec!["../fuzz/fuzz.c", "../fuzz/xml.c"];
     for source in source_files {
-        let output_file = format!("../fuzz/{}.o", Path::new(source).file_stem().unwrap().to_str().unwrap());
+        let output_file = format!(
+            "../fuzz/{}.o",
+            Path::new(source).file_stem().unwrap().to_str().unwrap()
+        );
         Command::new(cc)
             .arg("-c")
             .arg(source)
             .arg("-o")
             .arg(output_file)
-            .arg(&include_path)  // Fix: Use builddir-{}/include
+            .arg(&include_path) // Fix: Use builddir-{}/include
             .arg(format!("-I{}", target_dir.join("include").display()))
             .current_dir(&build_dir)
             .status()
             .expect(&format!("Couldn't compile {}", source));
     }
- 
+
     // Check if fuzz.o and xml.o exist
     let fuzz_o_path = build_dir.join("../fuzz/fuzz.o");
     let xml_o_path = build_dir.join("../fuzz/xml.o");
@@ -70,7 +74,7 @@ pub fn build_fuzz_xml(target_dir: &Path, task_id: Option<String>) {
     if !fuzz_o_path.exists() || !xml_o_path.exists() {
         panic!("Error: fuzz.o or xml.o not found. Ensure `make` completed successfully.");
     }
- 
+
     // Link the fuzz-xml binary
     let fuzz_binary = build_dir.join("fuzz-xml");
     Command::new(cc)
@@ -78,7 +82,10 @@ pub fn build_fuzz_xml(target_dir: &Path, task_id: Option<String>) {
         .arg(&fuzz_binary)
         .arg("../fuzz/xml.o")
         .arg("../fuzz/fuzz.o")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg(".libs/libxml2.a")
         .arg("-Wl,-Bstatic")
         .arg("-lz")

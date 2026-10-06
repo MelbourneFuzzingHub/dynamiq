@@ -39,7 +39,8 @@ pub fn build_libpcap_fuzz_both(target_dir: &Path, task_id: Option<String>) {
         .expect("Couldn't build libpcap with make");
 
     // Retrieve the AFL++ path from the environment variable
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Compile the fuzz_both.o object file
     Command::new("afl-clang-fast")
@@ -58,7 +59,10 @@ pub fn build_libpcap_fuzz_both(target_dir: &Path, task_id: Option<String>) {
         .arg("-o")
         .arg("libpcap_fuzz_both")
         .arg("libpcap.a")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg("-ldbus-1")
         .current_dir(&build_dir)
         .status()

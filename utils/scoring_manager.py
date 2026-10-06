@@ -268,13 +268,28 @@ class ScoringManager:
         X = np.array(metric_vectors)
         norm = MinMaxScaler().fit_transform(X)
         eps = 1e-12
-        prob = norm / (np.sum(norm, axis=0) + eps)
-        entropy = -np.sum(prob * np.log(prob + eps), axis=0)
-        max_entropy = np.log(len(node_list))
-        info_gain = 1 - entropy / (max_entropy + eps)
-        weights = info_gain / (np.sum(info_gain) + eps)
+        metric_ranges = np.ptp(X, axis=0)
+        active_metrics = metric_ranges > eps
+        weights = np.zeros(X.shape[1])
 
-        scores = norm.dot(weights) * 100
+        if np.any(active_metrics):
+            norm_active = norm[:, active_metrics]
+            prob = norm_active / (np.sum(norm_active, axis=0) + eps)
+            entropy = -np.sum(prob * np.log(prob + eps), axis=0)
+            max_entropy = np.log(len(node_list))
+            info_gain = 1 - entropy / (max_entropy + eps)
+            info_gain = np.maximum(info_gain, 0.0)
+            total_info_gain = np.sum(info_gain)
+
+            if total_info_gain > eps:
+                weights[active_metrics] = info_gain / total_info_gain
+            else:
+                weights[active_metrics] = 1.0 / np.sum(active_metrics)
+
+            scores = norm.dot(weights) * 100
+        else:
+            weights[:] = 0.0
+            scores = np.ones(len(node_list))
 
         MAX_UNINFORMED_SCORE = 10.0
         UNINFORMED_SCALE = 0.5

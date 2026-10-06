@@ -34,6 +34,7 @@ static char *afl_environment_variables[] = {
     "AFL_EARLY_FORKSERVER", "AFL_ENTRYPOINT", "AFL_EXIT_WHEN_DONE",
     "AFL_EXIT_ON_TIME", "AFL_EXIT_ON_SEED_ISSUES", "AFL_FAST_CAL",
     "AFL_FINAL_SYNC", "AFL_FORCE_UI", "AFL_FRIDA_DEBUG_MAPS",
+    "AFL_REMOVE_ACKED_SHARED_SYNC",
     "AFL_FRIDA_DRIVER_NO_HOOK", "AFL_FRIDA_EXCLUDE_RANGES",
     "AFL_FRIDA_INST_CACHE_SIZE", "AFL_FRIDA_INST_COVERAGE_ABSOLUTE",
     "AFL_FRIDA_INST_COVERAGE_FILE", "AFL_FRIDA_INST_DEBUG_FILE",
@@ -123,4 +124,3 @@ static char *afl_environment_variables[] = {
 extern char *afl_environment_variables[];
 
 #endif
-

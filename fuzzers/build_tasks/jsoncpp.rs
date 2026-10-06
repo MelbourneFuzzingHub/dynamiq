@@ -41,12 +41,16 @@ pub fn build_jsoncpp_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .expect("Couldn't build jsoncpp_fuzzer with make");
 
     // Retrieve the AFL++ path from the environment variable
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Compile the jsoncpp_fuzzer binary
     Command::new("afl-clang-fast++")
         .arg("-I../include")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg("../src/test_lib_json/fuzz.cpp")
         .arg("-o")
         .arg("jsoncpp_fuzzer")

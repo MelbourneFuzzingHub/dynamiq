@@ -40,7 +40,8 @@ pub fn build_cms_transform_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .expect("Couldn't build cms_transform_fuzzer with make");
 
     // Retrieve the AFL++ path from the environment variable
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Compile the cms_transform_fuzzer object file
     Command::new("afl-clang-fast")
@@ -58,7 +59,10 @@ pub fn build_cms_transform_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .arg("cms_transform_fuzzer.o")
         .arg("-o")
         .arg("cms_transform_fuzzer")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg("src/.libs/liblcms2.a")
         .arg("-lz")
         .current_dir(&build_dir)

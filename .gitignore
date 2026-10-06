@@ -132,8 +132,10 @@ aflsmart
 
 fuzzers/.cur_input*
 fuzzers/task_*
-fuzzers/Cargo.lock
 fuzzers/src/task_*
 fuzzers/timeouts
+/exp/subjects/
+/exp/results/
+/exp/fuzzers_build/
 
 backup

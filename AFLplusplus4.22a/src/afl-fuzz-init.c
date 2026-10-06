@@ -502,6 +502,9 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
   if (!afl->foreign_sync_cnt) return;
 
+  u8 remove_acked_shared_sync =
+      getenv("AFL_REMOVE_ACKED_SHARED_SYNC") != NULL;
+
   struct dirent **nl;
   s32             nl_cnt;
   u32             i, iter;
@@ -528,6 +531,8 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
       } else {
         snprintf(foreign_name, sizeof(foreign_name), "%s_%u", name, iter);
       }
+      u8 remove_processed_file =
+          remove_acked_shared_sync && !strcmp(name, "shared_sync");
 
       /* Scan the foreign sync directory */
       nl_cnt = scandir(afl->foreign_syncs[iter].dir, &nl, NULL, NULL);
@@ -607,6 +612,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
         }
 
         if (hash_set_contains(afl->processed_hashes, test_case_hash)) {
+          if (remove_processed_file) { unlink((const char *)fn2); }
           ck_free(fn2);
           ck_free(test_case_hash);
           continue;  /* already processed */
@@ -640,6 +646,7 @@ void read_foreign_testcases(afl_state_t *afl, int first) {
 
         /* Mark this dedupe key as processed */
         hash_set_insert(afl->processed_hashes, test_case_hash);
+        if (remove_processed_file) { unlink((const char *)fn2); }
 
         ck_free(fn2);
         ck_free(test_case_hash);
@@ -3206,4 +3213,3 @@ void save_cmdline(afl_state_t *afl, u32 argc, char **argv) {
   *buf = 0;
 
 }
-

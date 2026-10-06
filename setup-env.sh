@@ -1,7 +1,8 @@
 #!/bin/sh
 
 # Set and create WORKDIR if missing
-export WORKDIR=~/fuzzingdynamiq
+export DYNAMIQ="${1:-$(pwd)}"
+export WORKDIR="${WORKDIR:-${DYNAMIQ}/exp}"
 echo "WORKDIR: $WORKDIR"
 [ ! -d "$WORKDIR" ] && mkdir -p "$WORKDIR"
 
@@ -16,10 +17,8 @@ export SUBJECTS=$WORKDIR/subjects
 export RESULTS=$WORKDIR/results
 
 # Tools and paths
-export DYNAMIQ=~/DynamiQ
-export AFLPLUSPLUS=~/DynamiQ/AFLplusplus4.22a
+export AFLPLUSPLUS="${DYNAMIQ}/AFLplusplus4.22a"
 
 # AFL++ sync behavior
 export AFL_SYNC_TIME=15
 export AFL_FINAL_SYNC=1
-

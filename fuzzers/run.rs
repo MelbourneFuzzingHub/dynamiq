@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,8 +11,42 @@ use num_cpus;
 use psutil::cpu::CpuTimesPercentCollector;
 use psutil::cpu::CpuTimesPercent;
 
-use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
+use libc::{cpu_set_t, sched_setaffinity, sched_getaffinity, CPU_SET, CPU_ZERO, CPU_ISSET};
 use std::os::unix::process::CommandExt;
+
+fn find_prebuilt_binary(binary: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("DYNAMIQ_LIBAFL_BIN_DIR") {
+        let candidate = Path::new(&dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    for dir in ["./target/release", "/opt/libafl-fuzzers/target/release"] {
+        let candidate = Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = Path::new(dir).join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn should_use_cargo() -> bool {
+    matches!(
+        std::env::var("DYNAMIQ_LIBAFL_USE_CARGO").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
 
 /// Command-line arguments for the fuzzing tool
 #[derive(Parser)]
@@ -53,6 +87,10 @@ struct Args {
     #[arg(short = 'n', long)]
     num_cores: Option<usize>,
 
+    /// Comma-separated host CPU IDs that must not run worker fuzzers
+    #[arg(long)]
+    skip_cores: Option<String>,
+
     /// Full command line to pass to the binary
     #[arg(long, num_args = 0.., allow_hyphen_values = true)]
     cmdline: String,
@@ -65,10 +103,6 @@ struct Args {
     #[arg(short = 'm', long)]
     cmplog_binary: Option<PathBuf>,
 
-    /// AFL Map Size (optional, default 65536)
-    #[arg(long, default_value_t = 65536)]
-    map_size: usize,
-
     /// Optional 8-character hash value (e.g., run identifier)
     #[arg(short = 'a', long)]
     hash: Option<String>,
@@ -78,10 +112,28 @@ struct Args {
     first_run: bool,
 }
 
-fn get_available_cores() -> Vec<usize> {
-    // Total number of cores
-    let total_cores = num_cpus::get();
-    println!("Total cores: {}", total_cores);
+fn get_allowed_cores() -> Vec<usize> {
+    unsafe {
+        let mut set: cpu_set_t = std::mem::zeroed();
+        CPU_ZERO(&mut set);
+        if sched_getaffinity(0, std::mem::size_of::<cpu_set_t>(), &mut set) == 0 {
+            let mut allowed = Vec::new();
+            for i in 0..1024 {
+                if CPU_ISSET(i, &set) {
+                    allowed.push(i);
+                }
+            }
+            if !allowed.is_empty() {
+                return allowed;
+            }
+        }
+    }
+    (0..num_cpus::get()).collect()
+}
+
+fn get_available_cores(skip: &std::collections::HashSet<usize>) -> Vec<usize> {
+    let allowed_cores = get_allowed_cores();
+    println!("Allowed cores: {:?}", allowed_cores);
     let mut vacant_cores = Vec::new();
 
     // Get CPU usage per core using psutil
@@ -93,9 +145,14 @@ fn get_available_cores() -> Vec<usize> {
 
     let cpu_times: Vec<CpuTimesPercent> = cpu_collector.cpu_times_percent_percpu().unwrap();
 
-    for (i, cpu) in cpu_times.iter().enumerate() {
-        if cpu.idle() > 97.0 { // Assume a core is 'available' if idle percentage > 97%
-            vacant_cores.push(i);
+    for &i in &allowed_cores {
+        if i < cpu_times.len() {
+            if skip.contains(&i) {
+                continue;
+            }
+            if cpu_times[i].idle() > 97.0 { // Assume a core is 'available' if idle percentage > 97%
+                vacant_cores.push(i);
+            }
         }
     }
 
@@ -189,6 +246,15 @@ fn run_command(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    let skip_cores: std::collections::HashSet<usize> = args
+        .skip_cores
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|core| core.parse().ok())
+        .collect();
+    println!("Skipping worker cores: {:?}", skip_cores);
+
     // Get available cores
     let used_cores_file = args.output_folder.join("used_cores.txt");
 
@@ -204,9 +270,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (cores, true)
     } else {
         println!("used_cores.txt not found, detecting available cores...");
-        let cores = get_available_cores();
+        let cores = get_available_cores(&skip_cores);
         (cores, false)
     };
+
+    // A previous exploration phase may have created used_cores.txt. Enforce
+    // the monitor reservation again instead of trusting stale contents.
+    available_cores.retain(|core| !skip_cores.contains(core));
 
     println!(
         "Available cores: {:?} (source: {})",
@@ -216,6 +286,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let num_cores = args.num_cores.unwrap_or_else(num_cpus::get);
     println!("Limiting to {} cores", num_cores);
+
+    // CPU-idle sampling is advisory. If it returns too few workers, fill from
+    // the process affinity mask while still respecting the reserved monitor.
+    if available_cores.len() < num_cores {
+        for core in get_allowed_cores() {
+            if available_cores.len() == num_cores {
+                break;
+            }
+            if skip_cores.contains(&core) || available_cores.contains(&core) {
+                continue;
+            }
+            available_cores.push(core);
+        }
+    }
 
     if available_cores.len() > num_cores {
         available_cores.truncate(num_cores);
@@ -254,7 +338,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             
             // Build the initial command arguments
-            let mut command_args = if args.first_run {
+            let mut command_args = if !should_use_cargo() {
+                if let Some(path) = find_prebuilt_binary(&cargo_bin) {
+                    println!("Using compiled binary for {}: {}", cargo_bin, path.display());
+                    vec![path.to_string_lossy().to_string()]
+                } else if args.first_run {
+                    println!("Prebuilt {} not found; compiling and running with `cargo run`", cargo_bin);
+                    vec![
+                        "cargo".to_string(),
+                        "run".to_string(),
+                        "--release".to_string(),
+                        "--bin".to_string(),
+                        cargo_bin.clone(),
+                        "--".to_string(),
+                    ]
+                } else {
+                    println!("Prebuilt {} not found; trying ./target/release/{}", cargo_bin, cargo_bin);
+                    vec![format!("./target/release/{}", cargo_bin.clone())]
+                }
+            } else if args.first_run {
                 println!("First run: compiling and running with `cargo run`");
                 vec![
                     "cargo".to_string(),
@@ -277,6 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "-s".to_string(), args.corpus_dir.to_string_lossy().to_string(),
                 "-o".to_string(), args.output_folder.join("crashes").to_string_lossy().to_string(),
                 "--core-id".to_string(), core.to_string(),
+                "--metrics-dir".to_string(), args.output_folder.to_string_lossy().to_string(),
             ]);
 
             // Add `-m` with the `cmplog_binary` if it is set
@@ -303,12 +406,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 command_args.push((i + 1).to_string());
             }
 
-            // Add the map size if it's different from the default (65536)
-            if args.map_size != 65536 {
-                command_args.push("--map-size".to_string());
-                command_args.push(args.map_size.to_string());
-            }
-            
             // Add the full command line provided in `cmdline` as `-p`
             command_args.push("-p".to_string());
             command_args.push(args.cmdline.clone());

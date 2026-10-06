@@ -28,10 +28,12 @@ pub fn build_ftfuzzer(target_dir: &Path, task_id: Option<String>) {
 
     // Clean existing directories
     if build_dir.exists() {
-        fs::remove_dir_all(&build_dir).expect("Failed to remove existing FreeType2 build directory");
+        fs::remove_dir_all(&build_dir)
+            .expect("Failed to remove existing FreeType2 build directory");
     }
     if libarchive_build_dir.exists() {
-        fs::remove_dir_all(&libarchive_build_dir).expect("Failed to remove existing libarchive build directory");
+        fs::remove_dir_all(&libarchive_build_dir)
+            .expect("Failed to remove existing libarchive build directory");
     }
 
     //Define install directory inside FreeType2 build directory
@@ -46,7 +48,8 @@ pub fn build_ftfuzzer(target_dir: &Path, task_id: Option<String>) {
     // Set environment variables
     let cc = "afl-clang-fast";
     let cxx = "afl-clang-fast++";
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // === Build libarchive with AFL++ ===
     println!("Building libarchive with AFL++");
@@ -118,7 +121,10 @@ pub fn build_ftfuzzer(target_dir: &Path, task_id: Option<String>) {
         .arg(format!("-I{}", libarchive_include_path.display()))
         .arg("../src/tools/ftfuzzer/ftfuzzer.cc")
         .arg(libfreetype_path.to_str().unwrap())
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg(libarchive_path.to_str().unwrap())
         .arg("-o")
         .arg(fuzzer_output.to_str().unwrap())

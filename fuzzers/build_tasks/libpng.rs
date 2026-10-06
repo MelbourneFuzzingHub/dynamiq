@@ -37,7 +37,8 @@ pub fn build_libpng_read_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .expect("Couldn't build libpng_read_fuzzer with make");
 
     // Retrieve the AFL++ path from the environment variable
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Compile the libpng_read_fuzzer binary
     Command::new("afl-clang-fast++")
@@ -46,7 +47,10 @@ pub fn build_libpng_read_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .arg("../contrib/oss-fuzz/libpng_read_fuzzer.cc")
         .arg("-o")
         .arg("libpng_read_fuzzer")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .arg(".libs/libpng16.a")
         .arg("-lz")
         .arg("-lm")

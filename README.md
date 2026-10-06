@@ -1,3 +1,32 @@
+# DynamiQ with Docker
+
+From the repository root, build the DynamiQ image and a target:
+
+```bash
+make -C exp/dynamiq image
+./exp/dynamiq/build-target.sh libpng
+```
+
+Use `./exp/dynamiq/build-target.sh [targets]` for one or more libraries.
+Replace `[targets]` with names from the `*-dynamiq` targets in
+[oss/Makefile](oss/Makefile), such as `libpng`, `libtiff`, `freetype2`, or
+`sqlite3`.
+
+The build script creates `exp/subjects` and `exp/results` in this repository
+and builds AFL++ on its first run. Set `WORKDIR` to use another host directory.
+Target binaries and seed corpora go under `exp/subjects/<target>` by default.
+Results go under `exp/results/out-<target>-dynamiq-<cores>core` by default.
+
+Run a built target with 5 cores for 24 hours, including 3 hours of exploration
+and 3 hours of exploitation:
+
+```bash
+TARGET=libpng CORES=5 TOTAL=86400 SCAN=10800 EXPLOIT=10800 \
+  ./exp/dynamiq/run-in-docker.sh /dynamiq/exp/dynamiq/run-dynamiq.sh
+```
+
+See [exp/dynamiq/README.md](exp/dynamiq/README.md) for experiment settings.
+
 # Build DynamiQ (Tested on Ubuntu 22.04)
 ## Install the dependencies
 ```bash
@@ -10,8 +39,8 @@ sudo apt-get install -y ninja-build meson # for some targets like harfbuzz
 ```
 ##  Setup path
 ```bash
-export WORKDIR=~/fuzzingdynamiq
 export DYNAMIQ=~/DynamiQ
+export WORKDIR=$DYNAMIQ/exp
 export AFLPLUSPLUS=~/DynamiQ/AFLplusplus4.22a
 ```
 # Install Rust
@@ -22,7 +51,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Setup DynamiQ
 ```bash
 cd $HOME
-git clone https://github.com/iany0/DynamiQ.git && cd DynamiQ
+git clone https://github.com/MelbourneFuzzingHub/dynamiq.git DynamiQ && cd DynamiQ
 source setup-env.sh $(pwd)
 make -f $DYNAMIQ/oss/Makefile prerequisites
 source ~/.bashrc
@@ -74,5 +103,4 @@ This will show the flags for configuring the binary, profiling tools, corpus, nu
 
 To run fuzzing experiments using DynamiQ, please refer to the setup:
 
-[oss/README.md](https://github.com/iany0/DynamiQ/blob/main/oss/README.md)
-
+[oss/README.md](oss/README.md)

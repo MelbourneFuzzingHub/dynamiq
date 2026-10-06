@@ -10,6 +10,9 @@ import logging
 import shutil
 import hashlib
 import uuid
+import csv
+import re
+import threading
 
 # Import DynamiQ's modules
 from utils import helpers
@@ -24,13 +27,350 @@ from tasks import random_partitioning as random_part
 Main loop of DynamiQ
 '''
 
+def env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def prune_queue_dirs(queue_dirs):
+    pruned = 0
+    for queue_dir in queue_dirs:
+        if not os.path.isdir(queue_dir):
+            continue
+        try:
+            shutil.rmtree(queue_dir)
+            os.makedirs(queue_dir, exist_ok=True)
+            pruned += 1
+        except OSError as exc:
+            logging.warning("[Sync] Failed to prune worker queue %s: %s", queue_dir, exc)
+    return pruned
+
+
+class ExecutionSampler:
+    def __init__(self, out_folder, log_file, interval):
+        self.out_folder = out_folder
+        self.log_file = log_file
+        self.interval = max(1, interval)
+        self.start_time = time.time()
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.phase = "initializing"
+        self.round = 0
+        self.libafl_offset = 0
+        self.active_libafl_logs = []
+        self.thread = None
+
+    def start(self):
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp",
+                    "elapsed_seconds",
+                    "round",
+                    "phase",
+                    "total_execs",
+                    "afl_monitor_execs",
+                    "libafl_execs",
+                    "libafl_offset",
+                    "libafl_live_execs",
+                ])
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        logging.info("[ExecutionSampler] Sampling executions every %d seconds into %s",
+                     self.interval, self.log_file)
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=2)
+        self.sample()
+
+    def set_phase(self, phase, round_id=None):
+        with self.lock:
+            self.phase = phase
+            if round_id is not None:
+                self.round = round_id
+
+    def set_active_libafl_logs(self, paths):
+        with self.lock:
+            self.active_libafl_logs = list(paths)
+
+    def clear_active_libafl_logs(self):
+        with self.lock:
+            self.active_libafl_logs = []
+
+    def rollover_libafl_execs(self):
+        with self.lock:
+            live_execs = self._read_libafl_live_execs_locked()
+            self.libafl_offset += live_execs
+            self.active_libafl_logs = []
+            logging.info("[ExecutionSampler] Rolled over LibAFL executions: live=%d, offset=%d",
+                         live_execs, self.libafl_offset)
+
+    def _run(self):
+        next_sample = self.start_time
+        while not self.stop_event.wait(max(0, next_sample - time.time())):
+            self.sample()
+            next_sample += self.interval
+
+    def sample(self):
+        with self.lock:
+            timestamp = time.time()
+            elapsed = timestamp - self.start_time
+            afl_execs = self._read_afl_monitor_execs()
+            libafl_live = self._read_libafl_live_execs_locked()
+            libafl_total = self.libafl_offset + libafl_live
+            total_execs = afl_execs + libafl_total
+            row = [
+                int(timestamp),
+                f"{elapsed:.3f}",
+                self.round,
+                self.phase,
+                total_execs,
+                afl_execs,
+                libafl_total,
+                self.libafl_offset,
+                libafl_live,
+            ]
+
+        with open(self.log_file, "a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+    def _read_afl_monitor_execs(self):
+        stats_path = os.path.join(self.out_folder, "active_runs", "monitor", "fuzzer_stats")
+        try:
+            with open(stats_path, "r") as f:
+                for line in f:
+                    if line.startswith("execs_done"):
+                        return int(line.split(":", 1)[1].strip())
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
+
+    def _read_libafl_live_execs_locked(self):
+        latest_by_log = []
+        for path in self.active_libafl_logs:
+            execs = self._read_latest_libafl_execs(path)
+            if execs is not None:
+                latest_by_log.append(execs)
+        return sum(latest_by_log)
+
+    @staticmethod
+    def _read_latest_libafl_execs(path):
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                pos = f.tell()
+                data = b""
+                block = 8192
+                while pos > 0 and len(data.splitlines()) < 200:
+                    read_size = min(block, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    data = f.read(read_size) + data
+            lines = data.decode(errors="ignore").splitlines()
+            latest_by_core = {}
+            for raw_line in reversed(lines):
+                core_match = re.search(r"Core\s+(\d+):.*executions:\s*([0-9][0-9,]*)", raw_line)
+                if core_match:
+                    core = core_match.group(1)
+                    if core not in latest_by_core:
+                        latest_by_core[core] = int(core_match.group(2).replace(",", ""))
+            if latest_by_core:
+                return sum(latest_by_core.values())
+            for raw_line in reversed(lines):
+                if "(GLOBAL)" not in raw_line:
+                    continue
+                match = re.search(r"executions:\s*([0-9][0-9,]*)", raw_line)
+                if match:
+                    return int(match.group(1).replace(",", ""))
+            for raw_line in reversed(lines):
+                match = re.search(r"executions:\s*([0-9][0-9,]*)", raw_line)
+                if match:
+                    return int(match.group(1).replace(",", ""))
+        except (OSError, ValueError):
+            return None
+        return None
+
+
+def append_timing_event(out_folder, event, round_id, seconds, **fields):
+    path = os.path.join(out_folder, "timing_events.csv")
+    needs_header = not os.path.exists(path)
+    fieldnames = ["timestamp", "event", "round", "seconds", "algorithm", "core", "task", "binary", "success"]
+    row = {name: "" for name in fieldnames}
+    row.update({
+        "timestamp": int(time.time()),
+        "event": event,
+        "round": round_id,
+        "seconds": f"{seconds:.3f}",
+    })
+    row.update(fields)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def resolve_libafl_command(binary, libafl_dir, libafl_bin_dir=None, use_cargo=False):
+    if use_cargo:
+        return ["cargo", "run", "--release", "--bin", binary, "--"]
+
+    candidates = []
+    if libafl_bin_dir:
+        candidates.append(os.path.join(libafl_bin_dir, binary))
+    env_bin_dir = os.environ.get("DYNAMIQ_LIBAFL_BIN_DIR")
+    if env_bin_dir:
+        candidates.append(os.path.join(env_bin_dir, binary))
+    if libafl_dir:
+        candidates.append(os.path.join(libafl_dir, "target", "release", binary))
+    candidates.append(os.path.join("/opt/libafl-fuzzers", "target", "release", binary))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            logging.info("[Initialization] Using compiled LibAFL binary for %s: %s", binary, candidate)
+            return [candidate]
+
+    path_candidate = shutil.which(binary)
+    if path_candidate:
+        logging.info("[Initialization] Using LibAFL binary from PATH for %s: %s", binary, path_candidate)
+        return [path_candidate]
+
+    logging.warning(
+        "[Initialization] No compiled LibAFL binary found for %s; falling back to cargo run",
+        binary,
+    )
+    return ["cargo", "run", "--release", "--bin", binary, "--"]
+
+
+def build_libafl_binaries(libafl_dir, env, use_cmplog=False, skip_build=False):
+    if skip_build:
+        logging.info("[Initialization] Skipping LibAFL Rust build by request")
+        return
+
+    cargo_toml = os.path.join(libafl_dir, "Cargo.toml") if libafl_dir else None
+    if not cargo_toml or not os.path.isfile(cargo_toml):
+        raise FileNotFoundError(f"LibAFL Cargo.toml not found under {libafl_dir}")
+
+    bins = ["run", "compile"]
+    if use_cmplog:
+        bins.extend(["parallel_sync_cmplog", "advanced_cmplog"])
+    else:
+        bins.extend(["parallel_sync", "advanced_sync"])
+    command = ["cargo", "build", "--release"]
+    for binary in bins:
+        command.extend(["--bin", binary])
+
+    build_env = env.copy()
+    build_env.pop("CC", None)
+    build_env.pop("CXX", None)
+    build_env.pop("AFL_CC", None)
+    build_env.pop("AFL_CXX", None)
+    build_env.pop("AFL_PATH", None)
+    build_env.pop("AFL_LLVM_INSTRUMENT", None)
+    build_env.pop("AFL_OLD_FORKSERVER", None)
+    raw_path = build_env.get("PATH", "")
+    blocked_path_fragments = (
+        "AFLplusplus",
+        "AFLplusplus4.22a",
+    )
+    path_entries = []
+    for entry in raw_path.split(os.pathsep):
+        if not entry or entry == ".":
+            continue
+        if any(fragment in entry for fragment in blocked_path_fragments):
+            continue
+        path_entries.append(entry)
+    preferred_entries = [
+        os.path.join(build_env.get("CARGO_HOME", "/root/.cargo"), "bin"),
+        build_env.get("LLVM_COMPILER_PATH", ""),
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ]
+    sanitized_path = []
+    for entry in preferred_entries + path_entries:
+        if entry and entry not in sanitized_path:
+            sanitized_path.append(entry)
+    build_env["PATH"] = os.pathsep.join(sanitized_path)
+
+    logging.info("[Initialization] Building LibAFL Rust binaries: %s", " ".join(command))
+    start = time.monotonic()
+    proc = subprocess.run(
+        command,
+        cwd=libafl_dir,
+        env=build_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    elapsed = time.monotonic() - start
+    logging.info("[Initialization] LibAFL Rust build finished in %.3fs with status %d", elapsed, proc.returncode)
+    if proc.returncode != 0:
+        logging.error("[Initialization] LibAFL Rust build failed with output:\n%s", proc.stdout)
+        raise RuntimeError(f"LibAFL Rust build failed with status {proc.returncode}")
+
+
+def tail_file(path, max_lines=40):
+    try:
+        with open(path, "r", errors="ignore") as f:
+            return "".join(f.readlines()[-max_lines:])
+    except OSError as err:
+        return f"<unable to read {path}: {err}>"
+
+
+def wait_phase_timeout(timeout, popens, log_paths, phase_name):
+    deadline = time.time() + max(0, timeout)
+    while True:
+        for proc in popens:
+            if not isinstance(proc, subprocess.Popen):
+                continue
+            ret = proc.poll()
+            if ret is not None:
+                tails = []
+                for log_path in log_paths:
+                    tails.append(f"--- {log_path} ---\n{tail_file(log_path)}")
+                raise RuntimeError(
+                    f"{phase_name} LibAFL worker exited early with status {ret}.\n"
+                    + "\n".join(tails)
+                )
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return 0
+        time.sleep(min(1.0, remaining))
+
+
 def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, pre_args, post_args,
          seed_corpus, out_folder, dict_file, dot_file, func_ids, func_bbs, cores, algorithm,
-         total_timeout, scanning_timeout, expl_timeout, target_folder, libafl_dir=None, cmplog_binary=None, use_cmplog_in_task=False):
+         total_timeout, scanning_timeout, expl_timeout, target_folder, libafl_dir=None, cmplog_binary=None,
+         use_cmplog_in_task=False, exec_log_file=None, exec_log_interval=300,
+         libafl_bin_dir=None, libafl_use_cargo=False, libafl_skip_build=False,
+         parallel_map_size=None):
     # Create a log file
     LOG_FILENAME = os.path.join(out_folder, "DynamiQ.log")
     logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG)
     logging.info("[Initialization] DynamiQ starts")
+
+    build_env = os.environ.copy()
+    if libafl_bin_dir:
+        build_env["DYNAMIQ_LIBAFL_BIN_DIR"] = libafl_bin_dir
+    if libafl_use_cargo:
+        build_env["DYNAMIQ_LIBAFL_USE_CARGO"] = "1"
+    build_libafl_binaries(libafl_dir, build_env, use_cmplog_in_task, libafl_skip_build)
+
+    sampler = None
+    if exec_log_file:
+        exec_log_path = exec_log_file if os.path.isabs(exec_log_file) else os.path.join(out_folder, exec_log_file)
+        sampler = ExecutionSampler(out_folder, exec_log_path, exec_log_interval)
+        sampler.start()
 
      # Check if profiling_binary and gcov_binary exist
     if not os.path.exists(profiling_binary):
@@ -63,6 +403,7 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     seedDir = os.path.join(activeDir, "seeds")
     taskDir = os.path.join(activeDir, "tasks")
     shared_sync_dir = os.path.join(activeDir, "shared_sync")
+    prune_worker_queues_after_sync = env_flag("DYNAMIQ_PRUNE_WORKER_QUEUES_AFTER_SYNC", False)
 
     # Create them all in a loop
     for d in [activeDir, instanceDir, originalSeedDir, seedDir, taskDir, shared_sync_dir]:
@@ -112,6 +453,15 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     env = os.environ.copy()
     env['AFL_SYNC_TIME'] = '15'
     env['AFL_FINAL_SYNC'] = '1'
+    env['AFL_REMOVE_ACKED_SHARED_SYNC'] = '1'
+    # DynamiQ assigns the monitor explicitly and reserves that CPU for it.
+    # Prevent AFL++ from replacing this affinity during its own startup.
+    env['AFL_NO_AFFINITY'] = '1'
+    rust_env = env.copy()
+    if libafl_bin_dir:
+        rust_env["DYNAMIQ_LIBAFL_BIN_DIR"] = libafl_bin_dir
+    if libafl_use_cargo:
+        rust_env["DYNAMIQ_LIBAFL_USE_CARGO"] = "1"
     interrupted = False  # Flag to detect manual interruption
 
     # Execute the command
@@ -125,7 +475,6 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
         sys.exit(1)
 
     # Execute the monitor command on the selected core
-    env = os.environ.copy()
     # Start the process without specifying cpu_affinity initially
     pmonitor = subprocess.Popen(
         fuzz_command,
@@ -150,7 +499,7 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     all_deleted_pairs = set()
 
     # Create map size
-    map_size = "65536"
+    map_size = str(parallel_map_size) if parallel_map_size else "65536"
 
     # Whether to use llvm coverage
     use_llvm = False
@@ -158,8 +507,10 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     if binary_name=="ossfuzz":
         use_llvm = True
         use_unit_diameter = True
-        # map_size = "262144"
-        # logging.info(f"Setting AFL_MAP_SIZE to {map_size}")
+        map_size = str(parallel_map_size) if parallel_map_size else "262144"
+        logging.info(f"[Initialization] Setting parallel AFL_MAP_SIZE to {map_size} for {binary_name}")
+    elif parallel_map_size:
+        logging.info(f"[Initialization] Setting parallel AFL_MAP_SIZE to {map_size} from override")
 
     # Create the combined command-line arguments
     cmdline = []
@@ -176,6 +527,7 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     # Generate an 8-char hash as dir name
     raw_hash = hashlib.sha1(str(uuid.uuid4()).encode()).hexdigest()[:8]
     logging.info(f"[Initialization] Generated unique hash for this run: {raw_hash}")
+    logging.info("[Initialization] Prune worker queues after sync: %s", prune_worker_queues_after_sync)
     # This is for running expriments in parallel, otherwise using binary_name should be enough
     extracted_binary_name = os.path.basename(os.path.dirname(func_ids))
     logging.info("[Initialization] Extracted binary name: %s", extracted_binary_name)
@@ -187,7 +539,10 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     # Start other fuzzing instances
     exploitMode = False  # Start in exploration mode
     curRound = 1
+    failure_status = 0
     while True:
+        if sampler:
+            sampler.set_phase("round_setup", curRound)
         logging.info("-------------------------------------------------------------------------------------------------------------------")
         logging.debug(f"[round {curRound}] Starting DynamiQ round with exploitMode={exploitMode}")
 
@@ -205,7 +560,14 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                 src_dirs = [os.path.join(instanceDir, "fuzzer_1", "queue")]
             else:
                 src_dirs = [os.path.join(instanceDir, f"fuzzer_{i}", "queue") for i in range(1, cores)]
-            helpers.sync_unique_testcases(src_dirs, shared_sync_dir)
+            helpers.sync_unique_testcases(
+                src_dirs,
+                shared_sync_dir,
+                used_cores_file=os.path.join(out_folder, "used_cores.txt"),
+            )
+            if prune_worker_queues_after_sync:
+                pruned = prune_queue_dirs(src_dirs)
+                logging.info("[Sync] Pruned %d stopped worker queues after syncing to shared_sync", pruned)
 
             # Save intermediate output log
             if os.path.exists(os.path.join(instanceDir, "output.txt")):
@@ -215,7 +577,7 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
         # Step-1. Prepare seed corpus
         seed_corpus_path = os.path.join(activeDir, "monitor", "queue")
         if curRound == 1:
-            seed_corpus_path = originalSeedDir
+            seed_corpus_path = seed_corpus
             seed_corpus_path_sync = os.path.join(activeDir, "monitor", "queue")
 
         helpers.count_seeds_in_seed_dir(seed_corpus_path, curRound)
@@ -254,6 +616,9 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                 os.mkdir(taskDir)
 
             logging.info("[Partitioning] Starting task generation with algorithm: %s", algorithm)
+            if sampler:
+                sampler.set_phase("partitioning", curRound)
+            partition_start = time.monotonic()
             # Proceed with the normal task generation process
             partitioners = {
                 "ldg": ldg.LDGPartitioner,
@@ -268,6 +633,10 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                     CG, main_v, v_fname_dict, fname_src_dict, fname_bbs_dict,
                     cores - 1, taskDir, all_deleted_pairs, None, use_unit_diameter
                 )
+                partition_elapsed = time.monotonic() - partition_start
+                logging.info("[Timing] partition round=%d algorithm=%s seconds=%.3f",
+                             curRound, algorithm, partition_elapsed)
+                append_timing_event(out_folder, "partition", curRound, partition_elapsed, algorithm=algorithm)
             else:
                 raise ValueError(f"Unsupported partitioning algorithm: {algorithm}")
 
@@ -279,14 +648,16 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
             os.chdir(libafl_dir)
 
             # Start fuzzing instances in exploitation mode
-            rust_command = [
-                "cargo", "run", "--release", "--bin", "run", "--",
+            rust_command = resolve_libafl_command(
+                "run", libafl_dir, libafl_bin_dir, libafl_use_cargo
+            ) + [
                 "--corpus-dir", seed_corpus_path,
                 "--active-dir", instanceDir,
                 "--task-dir", taskDir,
                 "--target-dir", target_folder,
                 "--binary-name", binary_name,
                 "--num-cores", str(cores - 1),
+                "--skip-cores", str(monitor_core),
                 "--output-folder", out_folder,
                 "--sync-instrumentation" # Enable instrumentaion in parallel
             ]
@@ -296,8 +667,6 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
             # Add optional dictionary if provided
             if dict_file:
                 rust_command += ["--token-file", dict_file]
-            if map_size != "65536":
-                rust_command += ["--map-size", map_size]
             if raw_hash:
                 rust_command += ["--hash", raw_hash]
             if cmplog_binary and use_cmplog_in_task:
@@ -314,10 +683,14 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                     rust_command,
                     stdout=output_file,
                     stderr=output_file,
+                    env=rust_env,
                     preexec_fn=os.setsid
                 )
                 popens.append(rust_proc)
             os.chdir('..')
+            if sampler:
+                sampler.set_active_libafl_logs([os.path.join(instanceDir, "output.txt")])
+                sampler.set_phase("exploitation", curRound)
 
         elif exploitMode == False and scanning_timeout > 0:
             # Navigate to the libafl fuzzer directory
@@ -325,25 +698,22 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
             logging.debug(f"[round {curRound}] Seed corpus: %s", seed_corpus_path)
 
             # Start fuzzing instances in exploration mode
-            rust_command = [
-                "cargo", "run", "--release", "--bin", "parallel_sync_cmplog" if cmplog_binary and use_cmplog_in_task else "parallel_sync", "--",
+            exploration_bin = "parallel_sync_cmplog" if cmplog_binary and use_cmplog_in_task else "parallel_sync"
+            rust_command = resolve_libafl_command(
+                exploration_bin, libafl_dir, libafl_bin_dir, libafl_use_cargo
+            ) + [
                 "--core-num", str(cores - 1),
+                "--skip-cores", str(monitor_core),
                 "--initial-corpus", os.path.join(instanceDir, "fuzzer_1", "queue"),
                 "--corpus-dir", seed_corpus_path,
                 "--binary-path", afl_binary,
                 "--output-folder", out_folder,
-                "--foreign-sync-dirs", seed_corpus_path_sync
             ]
 
-            if actual_core_affinity:
-                # join into comma-separated list
-                skip = ",".join(str(c) for c in actual_core_affinity)
-                rust_command += ["--skip-cores", skip]
             # Add optional dictionary if provided
             if dict_file:
                 rust_command += ["--token-file", dict_file]
-            if map_size != "65536":
-                rust_command += ["--map-size", map_size]
+            rust_command += ["--map-size", map_size]
             # Add optional cmplog binary
             if cmplog_binary and use_cmplog_in_task:
                 rust_command += ["--cmplog-dir", cmplog_binary]
@@ -355,12 +725,19 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                     rust_command, 
                     stdout=output_file, 
                     stderr=output_file, 
+                    env=rust_env,
                     preexec_fn=os.setsid
                 )
             os.chdir('..')
             popens.append(rust_proc)
+            if sampler:
+                sampler.set_active_libafl_logs([output_file_path])
+                sampler.set_phase("exploration", curRound)
         else:
             logging.debug(f"[round {curRound}] Skipping exploration phase (scanning_timeout = 0)")
+            if sampler:
+                sampler.clear_active_libafl_logs()
+                sampler.set_phase("idle", curRound)
 
         # Step-4. Wait until the stopping criteria meet
         current_time = time.time()
@@ -372,15 +749,29 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                 # Adjust the exploitation timeout if necessary
                 adjusted_expl_timeout = min(expl_timeout, max(0, time_left))
                 logging.debug(f"[round {curRound}] Exploitation mode: waiting for {adjusted_expl_timeout} seconds")
-                helpers.should_stop_timeout(adjusted_expl_timeout)
+                wait_phase_timeout(
+                    adjusted_expl_timeout,
+                    popens,
+                    [os.path.join(instanceDir, "cpu_bindings.txt"), os.path.join(instanceDir, "output.txt")],
+                    f"round {curRound} exploitation",
+                )
             else:
                 # Adjust the scanning timeout if necessary
                 adjusted_scanning_timeout = min(scanning_timeout, max(0, time_left))
                 logging.debug(f"[round {curRound}] Scanning mode: waiting for {adjusted_scanning_timeout} seconds")
-                helpers.should_stop_timeout(adjusted_scanning_timeout)
+                wait_phase_timeout(
+                    adjusted_scanning_timeout,
+                    popens,
+                    [os.path.join(out_folder, "parallel_output.txt")],
+                    f"round {curRound} exploration",
+                )
         except KeyboardInterrupt:
             logging.debug(f"[round {curRound}] Fuzzing interrupted manually; preparing to shut down after cleanup.")
             interrupted = True  # Mark for post-cleanup exit
+        except RuntimeError as err:
+            logging.error("%s", err)
+            interrupted = True
+            failure_status = 1
 
         # Update elapsed time after waiting
         current_time = time.time()
@@ -402,6 +793,8 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
                     logging.debug(f"[round {curRound}] Process with PID {pid} does not exist")
 
         # Send SIGTERM signal to stop fuzzing instances
+        if sampler:
+            sampler.set_phase("stopping_workers", curRound)
         for p in popens:
             try:
                 # Wrap Popen objects with psutil.Process to check process status
@@ -418,6 +811,8 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
             except Exception as e:
                 logging.error(f"[round {curRound}] Failed to terminate process {p.pid}: {e}")
 
+        if sampler:
+            sampler.rollover_libafl_execs()
 
         # Delete the pids.txt file after stopping the processes
         if os.path.exists(pid_file):
@@ -445,7 +840,10 @@ def main(binary_name, afl_binary, profiling_binary, gcov_binary, gcov_folders, p
     pmonitor.wait()
 
     logging.debug(f"[round {curRound}] DynamiQ ends!!!")
-    return 0
+    if sampler:
+        sampler.set_phase("finished", curRound)
+        sampler.stop()
+    return failure_status
 
 # Parse the input arguments
 if __name__ == '__main__':
@@ -506,7 +904,16 @@ if __name__ == '__main__':
     parser.set_defaults(use_cmplog_in_task=None)  # default is "unspecified"
     parser.add_argument('-f', '--func_ids', type=str, required=False, help=argparse.SUPPRESS)
     parser.add_argument('-b', '--func_bbs', type=str, required=False, help=argparse.SUPPRESS)
+    parser.add_argument('--exec-log-file', type=str, required=False,
+                        help="Optional CSV path for cumulative execution samples")
+    parser.add_argument('--exec-log-interval', type=int, default=300,
+                        help="Execution sampling interval in seconds")
+    parser.add_argument('--libafl-bin-dir', type=str, required=False, help=argparse.SUPPRESS)
+    parser.add_argument('--libafl-use-cargo', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--libafl-skip-build', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--parallel-map-size', type=int, required=False, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    helpers.validate_out_folder(args.out_folder)
     # Resolve libafl_dir to the default (fuzzers/ under current script directory) if not provided
     if args.libafl_dir:
         libafl_dir = args.libafl_dir
@@ -537,7 +944,10 @@ if __name__ == '__main__':
         else:
             if args.cmplog_binary:
                 print("[*] --no-use_cmplog_in_task specified, cmplog binary will not be used in each task.")
-    main(args.binary, args.afl_binary, args.profiling_binary, args.gcov_binary, args.gcov_folders,
-         args.pre_arguments, args.post_arguments, args.seed_corpus, args.out_folder, args.dict,
-         args.dot_file, func_ids, func_bbs, args.cores, args.algorithm, args.total_timeout,
-         args.scanning_timeout, args.expl_timeout, args.target_folder, libafl_dir, args.cmplog_binary, args.use_cmplog_in_task)
+    sys.exit(main(args.binary, args.afl_binary, args.profiling_binary, args.gcov_binary, args.gcov_folders,
+                  args.pre_arguments, args.post_arguments, args.seed_corpus, args.out_folder, args.dict,
+                  args.dot_file, func_ids, func_bbs, args.cores, args.algorithm, args.total_timeout,
+                  args.scanning_timeout, args.expl_timeout, args.target_folder, libafl_dir, args.cmplog_binary,
+                  args.use_cmplog_in_task, args.exec_log_file, args.exec_log_interval,
+                  args.libafl_bin_dir, args.libafl_use_cargo, args.libafl_skip_build,
+                  args.parallel_map_size))

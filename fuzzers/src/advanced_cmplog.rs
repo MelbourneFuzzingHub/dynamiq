@@ -6,14 +6,14 @@ use libafl_bolts::prelude::OwnedRefMut;
 use libafl_targets::{AFLppCmpLogMap, AFLppCmpLogObserver, AFLppCmplogTracingStage};
 
 use std::fs;
-use std::io::{BufReader, BufRead};
+use std::io::{BufReader, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use libafl::monitors::MultiMonitor;
-use libafl::prelude::powersched::PowerSchedule;
-use libafl::prelude::{AFLppRedQueen, AflMapFeedback, CrashFeedback, StdMOptMutator, StdWeightedScheduler};
+use libafl::prelude::powersched::{PowerSchedule, SchedulerMetadata};
+use libafl::prelude::{AFLppRedQueen, AflMapFeedback, CrashFeedback, StdMOptMutator};
 use libafl_bolts::rands::StdRand;
 use libafl_bolts::shmem::{ShMem, ShMemProvider, StdShMemProvider};
 use libafl_bolts::tuples::{tuple_list, Handled, Merge};
@@ -28,7 +28,7 @@ use libafl::monitors::tui::{ui::TuiUI, TuiMonitor};
 #[cfg(not(feature = "tui"))]
 use libafl::mutators::{havoc_mutations, tokens_mutations, Tokens};
 use libafl::observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver};
-use libafl::schedulers::IndexesLenTimeMinimizerScheduler;
+use libafl::schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler};
 use libafl::stages::{CalibrationStage, ColorizationStage, IfStage, StdPowerMutationalStage};
 use libafl::state::{HasCorpus, HasCurrentTestcase, StdState};
 use libafl::{feedback_or, feedback_or_fast, Error, Fuzzer, HasMetadata, StdFuzzer};
@@ -89,13 +89,17 @@ struct Args {
     #[arg(short = 'n', long)]
     task_number: Option<usize>,
 
-    /// AFL Map Size (optional, default 131072)
+    /// AFL Map Size (optional, default 262144)
     #[arg(long, default_value_t = 262144)]
     map_size: usize,
 
     /// Optional 8-character hash value 
     #[arg(short = 'a', long)]
     hash: Option<String>,
+
+    /// Directory for DynamiQ timing metrics
+    #[arg(long)]
+    metrics_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -108,6 +112,76 @@ impl Args {
         }
         Duration::from_secs(self.foreign_sync_interval)
     }
+}
+
+fn append_compile_timing(
+    metrics_dir: Option<&PathBuf>,
+    core_id: usize,
+    task_file: &Path,
+    binary_name: &str,
+    elapsed_secs: f64,
+    success: bool,
+) {
+    let Some(dir) = metrics_dir else {
+        return;
+    };
+    let path = dir.join("timing_events.csv");
+    let needs_header = !path.exists();
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if needs_header {
+                let _ = writeln!(
+                    file,
+                    "timestamp,event,round,seconds,algorithm,core,task,binary,success"
+                );
+            }
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let task = task_file.to_string_lossy();
+            let _ = writeln!(
+                file,
+                "{},recompile,,{:.3},,{},{},{},{}",
+                timestamp, elapsed_secs, core_id, task, binary_name, success
+            );
+        }
+        Err(err) => eprintln!("Failed to write compile timing to {}: {}", path.display(), err),
+    }
+}
+
+fn find_prebuilt_binary(binary: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("DYNAMIQ_LIBAFL_BIN_DIR") {
+        let candidate = Path::new(&dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    for dir in ["./target/release", "/opt/libafl-fuzzers/target/release"] {
+        let candidate = Path::new(dir).join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = Path::new(dir).join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn should_use_cargo() -> bool {
+    matches!(
+        std::env::var("DYNAMIQ_LIBAFL_USE_CARGO").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 /// Round up to the next power-of-two-like bucket (1, 2, 4, 8, 16 max).
@@ -134,7 +208,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let target_dir = args.target_dir.to_string_lossy().to_string();
-
     let map_size = args.map_size;
     println!("Using AFL_MAP_SIZE: {}", map_size);
 
@@ -156,12 +229,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Foreign sync interval: {:?}", sync_interval);
     
     // Call the compile script with the task file path
-    let mut compile_command = Command::new("cargo");
+    let mut compile_command = if !should_use_cargo() {
+        if let Some(path) = find_prebuilt_binary("compile") {
+            Command::new(path)
+        } else {
+            let mut command = Command::new("cargo");
+            command
+                .arg("run")
+                .arg("--bin")
+                .arg("compile")
+                .arg("--");
+            command
+        }
+    } else {
+        let mut command = Command::new("cargo");
+        command
+            .arg("run")
+            .arg("--bin")
+            .arg("compile")
+            .arg("--");
+        command
+    };
     compile_command
-        .arg("run")
-        .arg("--bin")
-        .arg("compile")
-        .arg("--")
         .arg("--task-file")
         .arg(&task_file_path)
         .arg("--target-dir")
@@ -187,7 +276,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for line in reader.lines().flatten() {
                 if let Some((task, value)) = line.split_once(':') {
                     if task.trim() == task_file_stem {
-                        if let Ok(d) = value.trim().parse::<usize>() {
+                        // Preserve the known-working PHP specialization from
+                        // the original DynamiQ AFL++ execution path.
+                        if args.binary_name == "php-fuzz-parser" {
+                            println!("ctx_k for {}: forced to 2 (php-fuzz-parser)", task);
+                            compile_command.arg("--ctx-k").arg("2");
+                        } else if let Ok(d) = value.trim().parse::<usize>() {
                             let k_val = bucketize(d, false);
                             println!("ctx_k for {}: {} (raw: {})", task, k_val, d);
                             compile_command.arg("--ctx-k").arg(k_val.to_string());
@@ -200,7 +294,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Running compilation command: {:?}", compile_command);
 
-    compile_command.status().expect("Failed to run compilation script");
+    let compile_start = Instant::now();
+    let compile_status = compile_command.status().expect("Failed to run compilation script");
+    let compile_elapsed = compile_start.elapsed().as_secs_f64();
+    println!(
+        "Compilation finished: task={}, seconds={:.3}, success={}",
+        task_file_path.display(),
+        compile_elapsed,
+        compile_status.success()
+    );
+    append_compile_timing(
+        args.metrics_dir.as_ref(),
+        args.core_id,
+        &task_file_path,
+        &binary_name,
+        compile_elapsed,
+        compile_status.success(),
+    );
+    if !compile_status.success() {
+        return Err(format!("Compilation failed for {}", task_file_path.display()).into());
+    }
+
+    let compiled_binary_path = if let Some(hash) = &args.hash {
+        let hash_dir = Path::new(hash);
+        hash_dir.join(&compiled_binary)
+    } else {
+        PathBuf::from(&compiled_binary)
+    };
+
+    if !compiled_binary_path.exists() {
+        panic!("Compiled binary not found: {}", compiled_binary_path.display());
+    } else {
+        println!("Compiled binary found: {}", compiled_binary_path.display());
+    }
+
+    println!("Current directory: {}", std::env::current_dir()?.display());
+
+    let compiled_binary_path = std::fs::canonicalize(&compiled_binary_path)?;
+    println!("Canonical binary path: {}", compiled_binary_path.display());
 
     //
     // Component: Corpus
@@ -233,7 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("AFL_SHM_ID", shm_id);
 
     let edges_observer = unsafe {
-        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
+        HitcountsMapObserver::new(StdMapObserver::new("MapObserver", shmem_buf)).track_indices()
     };
 
     // Clone the observer for later use in minimizer
@@ -283,6 +414,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut feedback,
         &mut objective,
     )?;
+    if !state.has_metadata::<SchedulerMetadata>() {
+        state.add_metadata(SchedulerMetadata::new(Some(PowerSchedule::EXPLORE)));
+    }
 
     //
     // Component: Mutator
@@ -304,11 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
-        StdWeightedScheduler::with_schedule(
-            &mut state,
-            &edges_observer,
-            Some(PowerSchedule::EXPLORE),
-        ),
+        QueueScheduler::new(),
     );
 
     //
@@ -325,34 +455,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let timeout = Duration::from_secs(20);
 
-    // Determine the compiled binary path based on whether hash is set
-    let compiled_binary_path = if let Some(hash) = &args.hash {
-        let hash_dir = Path::new(hash);
-        hash_dir.join(&compiled_binary)
-    } else {
-        PathBuf::from(&compiled_binary)
-    };
-
-    // Verify the compiled binary exists
-    if !compiled_binary_path.exists() {
-        panic!("Compiled binary not found: {}", compiled_binary_path.display());
-    } else {
-        println!("Compiled binary found: {}", compiled_binary_path.display());
-    }
-
-    // Show current working directory
-    println!("Current directory: {}", std::env::current_dir()?.display());
-
-    // Canonical path
-    let compiled_binary_path = std::fs::canonicalize(&compiled_binary_path)?;
-    println!("Canonical binary path: {}", compiled_binary_path.display());
-
-
     let full_cmdline = args.cmdline.split_whitespace().collect::<Vec<_>>();
     println!("Constructed Command in Rust: {:?}", full_cmdline);
 
     let mut tokens = Tokens::new();
-    let is_deferred = binary_name != "fuzz_dtlsclient";
+    let is_deferred = binary_name != "fuzz_dtlsclient" && binary_name != "sndfile_fuzzer";
     println!("Using deferred forkserver: {}", is_deferred);
     let mut executor = ForkserverExecutor::builder()
         .program(compiled_binary_path.to_str().unwrap())

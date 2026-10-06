@@ -22,7 +22,8 @@ pub fn build_sqlite3_afl(target_dir: &Path, task_id: Option<String>) {
     // Set environment variables
     let cc = "afl-clang-fast";
     let cxx = "afl-clang-fast++";
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     let cflags = "-DSQLITE_MAX_LENGTH=128000000 -DSQLITE_MAX_SQL_LENGTH=128000000 \
                   -DSQLITE_MAX_MEMORY=25000000 -DSQLITE_PRINTF_PRECISION_LIMIT=1048576 \
@@ -90,7 +91,10 @@ pub fn build_sqlite3_afl(target_dir: &Path, task_id: Option<String>) {
         .arg(&ossfuzz_binary)
         .arg(&ossfuzz_obj)
         .arg("sqlite3.o")
-        .arg(format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .arg(format!(
+            "{}/utils/aflpp_driver/libAFLDriver.a",
+            aflplusplus_path
+        ))
         .current_dir(&build_dir)
         .status()
         .expect("Failed to link ossfuzz binary");

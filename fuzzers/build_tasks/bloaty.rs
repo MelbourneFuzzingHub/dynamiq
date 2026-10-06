@@ -20,7 +20,8 @@ pub fn build_bloaty_fuzzer(target_dir: &Path, task_id: Option<String>) {
     fs::create_dir_all(&build_dir).expect("Failed to create Bloaty build directory");
 
     // Retrieve the AFL++ path from environment variables
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Run CMake configuration
     println!("Configuring Bloaty with CMake...");
@@ -28,10 +29,13 @@ pub fn build_bloaty_fuzzer(target_dir: &Path, task_id: Option<String>) {
         .arg("-G")
         .arg("Ninja")
         .arg("-DBUILD_TESTING=false")
-        .arg("..")  // Assume source is in parent directory
+        .arg("..") // Assume source is in parent directory
         .env("CC", "afl-clang-fast")
         .env("CXX", "afl-clang-fast++")
-        .env("LIB_FUZZING_ENGINE", format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path))
+        .env(
+            "LIB_FUZZING_ENGINE",
+            format!("{}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path),
+        )
         .env("MAP_SIZE_POW2", "17")
         .current_dir(&build_dir)
         .status()

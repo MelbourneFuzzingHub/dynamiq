@@ -4,54 +4,71 @@ use libafl::stages::mutational::MultiMutationalStage;
 use libafl_bolts::prelude::OwnedRefMut;
 use libafl_targets::{AFLppCmpLogMap, AFLppCmpLogObserver, AFLppCmplogTracingStage};
 
-use libafl::prelude::powersched::PowerSchedule;
-use libafl::prelude::{tokens_mutations, AFLppRedQueen, AflMapFeedback, CrashFeedback, StdMOptMutator, StdWeightedScheduler, Tokens};
-use libafl_bolts::rands::StdRand;
-use libafl_bolts::shmem::{ShMem, ShMemProvider, StdShMemProvider};
-use libafl_bolts::tuples::{tuple_list, Handled, Merge};
-use libafl_bolts::core_affinity::Cores;
-use libafl_bolts::{current_nanos, AsSliceMut};
+use clap::Parser;
 use libafl::corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus};
-use libafl::events::{EventConfig, launcher::Launcher};
+use libafl::events::{launcher::Launcher, EventConfig};
 use libafl::executors::ForkserverExecutor;
 use libafl::feedbacks::{TimeFeedback, TimeoutFeedback};
 use libafl::inputs::BytesInput;
 #[cfg(feature = "tui")]
 use libafl::monitors::tui::{ui::TuiUI, TuiMonitor};
-#[cfg(not(feature = "tui"))]
-use libafl::prelude::MultiMonitor;
 use libafl::mutators::havoc_mutations;
 use libafl::observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver};
-use libafl::schedulers::{IndexesLenTimeMinimizerScheduler};
+use libafl::prelude::powersched::{PowerSchedule, SchedulerMetadata};
+#[cfg(not(feature = "tui"))]
+use libafl::prelude::MultiMonitor;
+use libafl::prelude::{
+    tokens_mutations, AFLppRedQueen, AflMapFeedback, CrashFeedback, StdMOptMutator, Tokens,
+};
+use libafl::schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler};
 use libafl::stages::{CalibrationStage, ColorizationStage, IfStage, StdPowerMutationalStage};
 use libafl::state::{HasCorpus, HasCurrentTestcase, StdState};
 use libafl::{feedback_or, feedback_or_fast, Error, Fuzzer, HasMetadata, StdFuzzer};
-use std::path::PathBuf;
-use std::time::Duration;
+use libafl_bolts::core_affinity::Cores;
+use libafl_bolts::rands::StdRand;
+use libafl_bolts::shmem::{ShMem, ShMemProvider, StdShMemProvider};
+use libafl_bolts::tuples::{tuple_list, Handled, Merge};
+use libafl_bolts::{current_nanos, AsSliceMut};
+use psutil::cpu::CpuTimesPercentCollector;
 use std::env;
-use clap::Parser;
 use std::fs::OpenOptions;
 use std::io::Write;
-use psutil::cpu::CpuTimesPercentCollector;
-use std::net::{TcpListener, SocketAddr};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::time::Duration;
 
+use libc::{cpu_set_t, sched_getaffinity, CPU_ISSET, CPU_ZERO};
+
+fn get_allowed_cores() -> Vec<usize> {
+    unsafe {
+        let mut set: cpu_set_t = std::mem::zeroed();
+        CPU_ZERO(&mut set);
+        if sched_getaffinity(0, std::mem::size_of::<cpu_set_t>(), &mut set) == 0 {
+            let mut allowed = Vec::new();
+            for i in 0..1024 {
+                if CPU_ISSET(i, &set) {
+                    allowed.push(i);
+                }
+            }
+            if !allowed.is_empty() {
+                return allowed;
+            }
+        }
+    }
+    (0..num_cpus::get()).collect()
+}
 
 // Function to get available cores based on idle threshold
 /// Returns up to `core_count` idle cores, excluding any in `skip`.
 fn get_available_cores(core_count: usize, skip: Option<&[usize]>) -> Vec<usize> {
-    let total_cores = num_cpus::get();
-    println!("Total cores on machine: {}", total_cores);
+    let allowed_cores = get_allowed_cores();
+    println!("Allowed cores on machine: {:?}", allowed_cores);
 
     // parse skip into a HashSet for O(1) lookups
-    let skip_set: std::collections::HashSet<usize> = skip
-        .unwrap_or(&[])
-        .iter()
-        .copied()
-        .collect();
+    let skip_set: std::collections::HashSet<usize> = skip.unwrap_or(&[]).iter().copied().collect();
 
     let mut vacant = Vec::new();
-    let mut cpu_col = CpuTimesPercentCollector::new()
-        .expect("Failed to create CPU collector");
+    let mut cpu_col = CpuTimesPercentCollector::new().expect("Failed to create CPU collector");
 
     // warm up collector
     std::thread::sleep(Duration::from_millis(100));
@@ -62,15 +79,17 @@ fn get_available_cores(core_count: usize, skip: Option<&[usize]>) -> Vec<usize> 
         .cpu_times_percent_percpu()
         .expect("Failed to get CPU times");
 
-    for (i, cpu) in cpu_times.iter().enumerate() {
-        // skip any cores the caller asked us to skip:
-        if skip_set.contains(&i) {
-            continue;
-        }
-        if cpu.idle() > 97.0 {
-            vacant.push(i);
-            if vacant.len() == core_count {
-                break;
+    for &i in &allowed_cores {
+        if i < cpu_times.len() {
+            // skip any cores the caller asked us to skip:
+            if skip_set.contains(&i) {
+                continue;
+            }
+            if cpu_times[i].idle() > 97.0 {
+                vacant.push(i);
+                if vacant.len() == core_count {
+                    break;
+                }
             }
         }
     }
@@ -82,21 +101,29 @@ fn get_available_cores(core_count: usize, skip: Option<&[usize]>) -> Vec<usize> 
             skip_set,
             core_count
         );
+        for &i in &allowed_cores {
+            if vacant.len() == core_count {
+                break;
+            }
+            if skip_set.contains(&i) || vacant.contains(&i) {
+                continue;
+            }
+            vacant.push(i);
+        }
+        eprintln!("Falling back to non-idle cores to satisfy requested core count.");
     }
 
     println!("Selected cores (after skip): {:?}", vacant);
     vacant
 }
 
-/// Attempts to find an open port within the given range.
-fn find_open_port(start: u16, end: u16) -> Option<u16> {
-    for port in start..=end {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if TcpListener::bind(addr).is_ok() {
-            return Some(port); // Return the first available port
-        }
-    }
-    None // Return None if no ports are available in the range
+/// Ask the OS for an available local port.
+fn find_open_port() -> Option<u16> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    TcpListener::bind(addr)
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|addr| addr.port())
 }
 
 #[derive(Parser, Debug)]
@@ -152,7 +179,7 @@ struct Args {
     cmplog_dir: PathBuf,
 
     /// AFL Map Size (optional, default 262144)
-    #[arg(long, default_value_t = 262144)]
+    #[arg(long, default_value_t = 65536)]
     map_size: usize,
 }
 
@@ -171,16 +198,15 @@ impl Args {
 fn main() -> Result<(), Error> {
     let args = Args::parse();
 
-    let broker_port_range = (1337, 1342);
-    let broker_port = match find_open_port(broker_port_range.0, broker_port_range.1) {
+    let broker_port = match find_open_port() {
         Some(port) => {
             println!("Selected open port: {}", port);
             port
-        },
+        }
         None => {
-            eprintln!("No open port found in the range {}-{}", broker_port_range.0, broker_port_range.1);
+            eprintln!("No open broker port available");
             return Err(Error::unknown("No open broker port available"));
-        },
+        }
     };
 
     let map_size = args.map_size;
@@ -205,8 +231,21 @@ fn main() -> Result<(), Error> {
         .collect::<Vec<String>>()
         .join(",");
 
-    // Convert available cores to a format compatible with `Cores`
-    let cores = Cores::from_cmdline(&available_cores_str )
+    // LibAFL's Launcher addresses cores by their index within the process's
+    // affinity mask, not by the host CPU ID exposed by sched_getaffinity.
+    let allowed_cores = get_allowed_cores();
+    let launcher_cores_str = available_cores
+        .iter()
+        .map(|core| {
+            allowed_cores
+                .iter()
+                .position(|allowed| allowed == core)
+                .expect("Selected core is outside the process affinity mask")
+                .to_string()
+        })
+        .collect::<Vec<String>>()
+        .join(",");
+    let cores = Cores::from_cmdline(&launcher_cores_str)
         .expect("Failed to create cores list from available core IDs");
 
     // Save the used cores to a shared file
@@ -215,6 +254,7 @@ fn main() -> Result<(), Error> {
         .expect("Unable to write used cores to file");
 
     println!("Using cores: {:?}", available_cores);
+    println!("LibAFL launcher core indices: {}", launcher_cores_str);
 
     println!(
         "Workdir: {:?}",
@@ -273,7 +313,7 @@ fn main() -> Result<(), Error> {
         std::env::set_var("AFL_MAP_SIZE", format!("{}", map_size));
 
         let edges_observer = unsafe {
-            HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
+            HitcountsMapObserver::new(StdMapObserver::new("MapObserver", shmem_buf)).track_indices()
         };
 
         //
@@ -303,8 +343,12 @@ fn main() -> Result<(), Error> {
                 timeouts_corpus,
                 &mut feedback,
                 &mut objective,
-            ).unwrap()
+            )
+            .unwrap()
         });
+        if !state.has_metadata::<SchedulerMetadata>() {
+            state.add_metadata(SchedulerMetadata::new(Some(PowerSchedule::EXPLORE)));
+        }
 
         //
         // Component: Mutator
@@ -324,14 +368,8 @@ fn main() -> Result<(), Error> {
         // Component: Scheduler
         //
 
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(
-            &edges_observer,
-            StdWeightedScheduler::with_schedule(
-                &mut state,
-                &edges_observer,
-                Some(PowerSchedule::EXPLORE),
-            ),
-        );
+        let scheduler =
+            IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
 
         //
         // Component: Fuzzer
@@ -352,10 +390,13 @@ fn main() -> Result<(), Error> {
         let timeout = Duration::from_secs(20);
         let mut tokens = Tokens::new();
         let binary_path_str = args.binary_path.to_str().unwrap().to_string();
-        let is_deferred = !binary_path_str.contains("fuzz_dtlsclient");//hardcode for now
+        // These harnesses use a regular main and do not call __AFL_INIT, so
+        // waiting for a deferred forkserver handshake would fail.
+        let is_deferred = !binary_path_str.contains("fuzz_dtlsclient")
+            && !binary_path_str.contains("sndfile_fuzzer");
         println!("Using deferred forkserver: {}", is_deferred);
         let mut executor = ForkserverExecutor::builder()
-            .program(&binary_path_str)  // Use the binary path argument
+            .program(&binary_path_str) // Use the binary path argument
             .autotokens(&mut tokens)
             .parse_afl_cmdline(full_cmdline.clone())
             .is_persistent(true)
@@ -376,7 +417,12 @@ fn main() -> Result<(), Error> {
 
         if state.corpus().count() < 1 {
             state
-                .load_initial_inputs(&mut fuzzer, &mut executor, &mut restarting_mgr, &corpus_dirs)
+                .load_initial_inputs(
+                    &mut fuzzer,
+                    &mut executor,
+                    &mut restarting_mgr,
+                    &corpus_dirs,
+                )
                 .unwrap_or_else(|err| {
                     panic!(
                         "Failed to load initial corpus at {:?}: {:?}",
@@ -394,10 +440,8 @@ fn main() -> Result<(), Error> {
         println!("empty folder ? {}", args.foreign_sync_dirs.is_empty());
         println!("sync interval: {:?}", sync_interval);
 
-        let sync_stage = SyncFromDiskStage::with_from_file(
-            args.foreign_sync_dirs.clone(), 
-            sync_interval
-        );
+        let sync_stage =
+            SyncFromDiskStage::with_from_file(args.foreign_sync_dirs.clone(), sync_interval);
 
         // The cmplog map shared between observer and executor
         let mut cmplog_shmem = shmem_provider.uninit_on_shmem::<AFLppCmpLogMap>().unwrap();
@@ -409,17 +453,20 @@ fn main() -> Result<(), Error> {
         let cmplog_ref = cmplog_observer.handle();
 
         let cmplog_binary_path = std::fs::canonicalize(&cmplog_binary_name)?;
-        println!("Compiled cmplog binary path: {}", cmplog_binary_path.display()); 
+        println!(
+            "Compiled cmplog binary path: {}",
+            cmplog_binary_path.display()
+        );
 
         let cmplog_executor = ForkserverExecutor::builder()
-                .program(cmplog_binary_path.to_str().unwrap())
-                .shmem_provider(&mut shmem_provider)
-                .parse_afl_cmdline(full_cmdline)
-                .is_persistent(true)
-                .is_deferred_frksrv(is_deferred)
-                .timeout(timeout * 10)
-                .build(tuple_list!(cmplog_observer))
-                .unwrap();
+            .program(cmplog_binary_path.to_str().unwrap())
+            .shmem_provider(&mut shmem_provider)
+            .parse_afl_cmdline(full_cmdline)
+            .is_persistent(true)
+            .is_deferred_frksrv(is_deferred)
+            .timeout(timeout * 10)
+            .build(tuple_list!(cmplog_observer))
+            .unwrap();
 
         let tracing = AFLppCmplogTracingStage::new(cmplog_executor, cmplog_ref);
 
@@ -427,10 +474,10 @@ fn main() -> Result<(), Error> {
         let rq = MultiMutationalStage::new(AFLppRedQueen::with_cmplog_options(true, true));
 
         let cb = |_fuzzer: &mut _,
-                    _executor: &mut _,
-                    state: &mut StdState<_, InMemoryOnDiskCorpus<_>, _, _>,
-                    _event_manager: &mut _|
-            -> Result<bool, Error> {
+                  _executor: &mut _,
+                  state: &mut StdState<_, InMemoryOnDiskCorpus<_>, _, _>,
+                  _event_manager: &mut _|
+         -> Result<bool, Error> {
             let testcase = state.current_testcase()?;
             let res = testcase.scheduled_count() == 1; // let's try on the 2nd trial
 
@@ -444,7 +491,7 @@ fn main() -> Result<(), Error> {
         fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut restarting_mgr)?;
         Ok(())
     };
-    
+
     match Launcher::builder()
         .shmem_provider(shmem_provider)
         .configuration(EventConfig::from_name("default"))

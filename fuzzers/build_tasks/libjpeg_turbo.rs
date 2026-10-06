@@ -19,7 +19,8 @@ pub fn build_libjpeg_turbo_fuzzer(target_dir: &Path, task_id: Option<String>) {
     fs::create_dir_all(&build_dir).expect("Failed to create build directory");
 
     // Retrieve AFL++ path from environment variable
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // Configure the build using CMake
     Command::new("cmake")
@@ -30,10 +31,16 @@ pub fn build_libjpeg_turbo_fuzzer(target_dir: &Path, task_id: Option<String>) {
             "-DENABLE_SHARED=0",
             "-DCMAKE_C_FLAGS_RELWITHDEBINFO=-g -DNDEBUG",
             "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=-g -DNDEBUG",
-            &format!("-DCMAKE_INSTALL_PREFIX={}", build_dir.join("install").display()),
+            &format!(
+                "-DCMAKE_INSTALL_PREFIX={}",
+                build_dir.join("install").display()
+            ),
             "-DWITH_FUZZ=1",
             &format!("-DFUZZ_BINDIR={}", build_dir.display()),
-            &format!("-DFUZZ_LIBRARY={}/utils/aflpp_driver/libAFLDriver.a", aflplusplus_path),
+            &format!(
+                "-DFUZZ_LIBRARY={}/utils/aflpp_driver/libAFLDriver.a",
+                aflplusplus_path
+            ),
         ])
         .env("CC", "/usr/local/bin/afl-clang-fast")
         .env("CXX", "/usr/local/bin/afl-clang-fast++")

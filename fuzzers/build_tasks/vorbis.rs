@@ -14,15 +14,21 @@ pub fn build_vorbis(target_dir: &Path, task_id: Option<String>) {
     };
 
     let vorbis_build_dir = target_dir.parent().unwrap().join(&build_dir_suffix);
-    let ogg_build_dir = target_dir.parent().unwrap().join("ogg").join(&build_dir_suffix);
+    let ogg_build_dir = target_dir
+        .parent()
+        .unwrap()
+        .join("ogg")
+        .join(&build_dir_suffix);
     let vorbis_build_afl = target_dir.join(&build_dir_suffix);
 
     // Prepare the AFL++ path
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // 1. Remove existing Vorbis build directory and recreate it
     if vorbis_build_dir.exists() {
-        fs::remove_dir_all(&vorbis_build_dir).expect("Failed to remove existing Vorbis build directory");
+        fs::remove_dir_all(&vorbis_build_dir)
+            .expect("Failed to remove existing Vorbis build directory");
     }
     fs::create_dir_all(&vorbis_build_dir).expect("Failed to create Vorbis build directory");
 
@@ -66,7 +72,8 @@ pub fn build_vorbis(target_dir: &Path, task_id: Option<String>) {
 
     // 3. Build Vorbis
     if vorbis_build_afl.exists() {
-        fs::remove_dir_all(&vorbis_build_afl).expect("Failed to remove existing Vorbis build directory");
+        fs::remove_dir_all(&vorbis_build_afl)
+            .expect("Failed to remove existing Vorbis build directory");
     }
     fs::create_dir_all(&vorbis_build_afl).expect("Failed to create Vorbis build directory");
 

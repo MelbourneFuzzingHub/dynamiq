@@ -1,8 +1,8 @@
 use std::env;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::process::Command;
-use std::io;
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     if !dst.exists() {
@@ -27,7 +27,10 @@ pub fn build_xpath(target_dir: &Path, task_id: Option<String>) {
     println!("Building libxslt with AFL instrumentation");
 
     // Determine build directories
-    let libxml2_target_dir = target_dir.parent().unwrap().join("libxml2");
+    // libxslt is built against its own pinned libxml2 checkout.  Keep this
+    // separate from the standalone libxml2 fuzz target, which may not have
+    // been built on this machine.
+    let libxml2_target_dir = target_dir.parent().unwrap().join("libxml2-xslt");
     let libxml2_build_dir = if let Some(id) = task_id.as_ref() {
         libxml2_target_dir.join(format!("builddir-{}", id))
     } else {
@@ -36,16 +39,18 @@ pub fn build_xpath(target_dir: &Path, task_id: Option<String>) {
 
     let libxslt_build_dir = if let Some(id) = task_id.as_ref() {
         target_dir.join(format!("builddir-{}", id))
-    } else {    
+    } else {
         target_dir.join("builddir")
     };
 
     // Prepare the AFL++ path
-    let aflplusplus_path = env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
+    let aflplusplus_path =
+        env::var("AFLPLUSPLUS").expect("AFLPLUSPLUS environment variable not set");
 
     // 1. Build libxml2
     if libxml2_build_dir.exists() {
-        fs::remove_dir_all(&libxml2_build_dir).expect("Failed to remove existing libxml2 build directory");
+        fs::remove_dir_all(&libxml2_build_dir)
+            .expect("Failed to remove existing libxml2 build directory");
     }
     fs::create_dir_all(&libxml2_build_dir).expect("Failed to create libxml2 build directory");
 
@@ -89,7 +94,8 @@ pub fn build_xpath(target_dir: &Path, task_id: Option<String>) {
 
     // 2. Build libxslt
     if libxslt_build_dir.exists() {
-        fs::remove_dir_all(&libxslt_build_dir).expect("Failed to remove existing libxslt build directory");
+        fs::remove_dir_all(&libxslt_build_dir)
+            .expect("Failed to remove existing libxslt build directory");
     }
     fs::create_dir_all(&libxslt_build_dir).expect("Failed to create libxslt build directory");
 
@@ -105,8 +111,14 @@ pub fn build_xpath(target_dir: &Path, task_id: Option<String>) {
         ])
         .env("CC", "afl-clang-fast")
         .env("CXX", "afl-clang-fast++")
-        .env("CPPFLAGS", &format!("-I{}", libxml2_build_dir.join("include").display()))
-        .env("LDFLAGS", &format!("-L{}", libxml2_build_dir.join(".libs").display()))
+        .env(
+            "CPPFLAGS",
+            &format!("-I{}", libxml2_build_dir.join("include").display()),
+        )
+        .env(
+            "LDFLAGS",
+            &format!("-L{}", libxml2_build_dir.join(".libs").display()),
+        )
         .current_dir(&libxslt_build_dir)
         .status()
         .expect("Failed to configure libxslt");
